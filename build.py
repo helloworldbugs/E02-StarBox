@@ -25,6 +25,9 @@ def main():
     parser.add_argument('--signing-key', help='Existing release keystore; never created automatically')
     parser.add_argument('--signing-alias', help='Alias in the existing release keystore')
     parser.add_argument('--signing-password-env', help='Environment variable containing the release keystore password')
+    parser.add_argument('--signing-key-file', help='PKCS#8 DER private key, e.g. a public platform.pk8')
+    parser.add_argument('--signing-cert-file', help='X.509 PEM certificate matching --signing-key-file')
+    parser.add_argument('--shared-user-id', help='Inject android:sharedUserId into the built manifest, e.g. android.uid.system')
     args = parser.parse_args()
     sdk = os.environ.get('ANDROID_HOME') or os.environ.get('ANDROID_SDK_ROOT')
     if not args.android_jar and not sdk:
@@ -34,7 +37,16 @@ def main():
     java = java_bin(args.java_home)
     if not android.is_file() or not (tools/'lib/d8.jar').is_file():
         parser.error('Android platform/build-tools paths are invalid.')
-    if args.signing_key:
+    public_key_mode = bool(args.signing_key_file or args.signing_cert_file)
+    if public_key_mode:
+        if not args.signing_key_file or not args.signing_cert_file:
+            parser.error('Public-key signing needs both --signing-key-file and --signing-cert-file.')
+        key_file, cert_file = Path(args.signing_key_file), Path(args.signing_cert_file)
+        if not key_file.is_file() or not cert_file.is_file():
+            parser.error('--signing-key-file or --signing-cert-file does not exist.')
+        if args.signing_key or args.signing_alias or args.signing_password_env:
+            parser.error('Do not mix public-key signing with keystore signing options.')
+    elif args.signing_key:
         key = Path(args.signing_key)
         if not key.is_file() or not args.signing_alias or not args.signing_password_env:
             parser.error('Release signing requires an existing key, alias, and password environment variable name.')
@@ -55,14 +67,20 @@ def main():
         run(executable(java,'javac'), '-encoding','UTF-8','--release','8','-classpath',str(android)+os.pathsep+str(ROOT/'third_party/zxing/core-3.5.3.jar'),'-d',classes,*sorted(src.glob('*.java')))
         run(executable(java,'java'),'-cp',tools/'lib/d8.jar','com.android.tools.r8.D8','--lib',android,'--min-api','28','--output',dex,*sorted(classes.rglob('*.class')),ROOT/'third_party/zxing/core-3.5.3.jar')
         build.mkdir(exist_ok=True)
+        manifest = src/'AndroidManifest.xml'
+        if args.shared_user_id:
+            generated = build/'gen'
+            generated.mkdir(exist_ok=True)
+            manifest = generated/'AndroidManifest.xml'
+            manifest.write_text((src/'AndroidManifest.xml').read_text(encoding='utf-8').replace('<manifest ', '<manifest android:sharedUserId="'+args.shared_user_id+'" ', 1), encoding='utf-8')
         unsigned, aligned = build/'unsigned.apk', build/'aligned.apk'
-        run(executable(tools,'aapt'),'package','-f','-M',src/'AndroidManifest.xml','-S',src/'res','-A',src/'assets','-I',android,'-F',unsigned)
+        run(executable(tools,'aapt'),'package','-f','-M',manifest,'-S',src/'res','-A',src/'assets','-I',android,'-F',unsigned)
         with zipfile.ZipFile(unsigned,'a',zipfile.ZIP_DEFLATED) as z:
             z.write(dex/'classes.dex','classes.dex')
         run(executable(tools,'zipalign'),'-f','4',unsigned,aligned)
     private = ROOT/'.local'
     private.mkdir(exist_ok=True)
-    if not args.signing_key:
+    if not args.signing_key and not public_key_mode:
         key = private/'development.p12'
         # This password protects a local development key, not a distributed credential.
         password = 'galaxy-local-development'
@@ -73,7 +91,12 @@ def main():
     dist.mkdir(exist_ok=True)
     apk = Path(args.output).resolve() if args.output else dist/'E02-Starbox-v1.7.3.apk'
     apk.parent.mkdir(parents=True,exist_ok=True)
-    run(executable(java,'java'),'-jar',tools/'lib/apksigner.jar','sign','--ks',key,'--ks-pass',password_arg,'--ks-key-alias',alias,'--min-sdk-version','28','--v4-signing-enabled','false','--out',apk,aligned)
+    if public_key_mode:
+        sign_args = ['--key', str(key_file), '--cert', str(cert_file)]
+    else:
+        sign_args = ['--ks', str(key), '--ks-pass', password_arg, '--ks-key-alias', alias]
+    v_schemes = ['--v1-signing-enabled','true','--v2-signing-enabled','true','--v3-signing-enabled','true'] if public_key_mode else []
+    run(executable(java,'java'),'-jar',tools/'lib/apksigner.jar','sign',*sign_args,*v_schemes,'--min-sdk-version','28','--v4-signing-enabled','false','--out',apk,aligned)
     run(executable(java,'java'),'-jar',tools/'lib/apksigner.jar','verify','--verbose',apk)
     run(executable(tools,'zipalign'),'-c','4',apk)
     print('Built:', apk)
